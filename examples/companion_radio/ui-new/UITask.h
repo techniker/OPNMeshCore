@@ -65,6 +65,8 @@ class UITask : public AbstractUITask {
 
 public:
 
+  float getAirtimeFactor() const;
+
   UITask(mesh::MainBoard* board, BaseSerialInterface* serial) : AbstractUITask(board, serial), _display(NULL), _sensors(NULL) {
     next_batt_chck = _next_refresh = 0;
     ui_started_at = 0;
