@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <helpers/CommonCLI.h>
 
-#define AUTO_OFF_MILLIS      20000  // 20 seconds
+#define AUTO_OFF_MILLIS      30000  // 30 seconds
 #define BOOT_SCREEN_MILLIS   4000   // 4 seconds
 
 // 'meshcore', 128x13px
@@ -76,6 +76,11 @@ void UITask::renderCurrScreen() {
     // bw / cr
     _display->setCursor(0, 30);
     sprintf(tmp, "BW: %03.2f CR: %d", _node_prefs->bw, _node_prefs->cr);
+    _display->print(tmp);
+
+    // Sixtopia Version
+    _display->setCursor(0, 40);
+    sprintf(tmp, "Sixtopia.net");
     _display->print(tmp);
   }
 }

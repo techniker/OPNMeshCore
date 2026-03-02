@@ -69,11 +69,11 @@ struct NeighbourInfo {
 };
 
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   "15 Feb 2026"
+  #define FIRMWARE_BUILD_DATE   "02 Mar 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.13.0"
+  #define FIRMWARE_VERSION   "v1.13.1"
 #endif
 
 #define FIRMWARE_ROLE "repeater"
@@ -87,9 +87,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long next_local_advert, next_flood_advert;
   bool _logging;
   NodePrefs _prefs;
-  ClientACL  acl;
   CommonCLI _cli;
   uint8_t reply_data[MAX_PACKET_PAYLOAD];
+  ClientACL  acl;
   uint8_t reply_path[MAX_PATH_SIZE];
   int8_t  reply_path_len;
   TransportKeyStore key_store;
