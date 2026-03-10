@@ -57,6 +57,7 @@
 #define CMD_SET_AUTOADD_CONFIG        58
 #define CMD_GET_AUTOADD_CONFIG        59
 #define CMD_GET_ALLOWED_REPEAT_FREQ   60
+#define CMD_SET_PATH_HASH_MODE        61
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -245,8 +246,13 @@ int MyMesh::getFromOfflineQueue(uint8_t frame[]) {
 }
 
 float MyMesh::getAirtimeBudgetFactor() const {
+#ifdef LAB_DISABLE_AIRTIME
+  return 0.0f;   // disable airtime limiting completely
+#else
   return _prefs.airtime_factor;
+#endif
 }
+
 
 int MyMesh::getInterferenceThreshold() const {
   return 0; // disabled for now, until currentRSSI() problem is resolved
@@ -255,6 +261,15 @@ int MyMesh::getInterferenceThreshold() const {
 int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
   if (_prefs.rx_delay_base <= 0.0f) return 0;
   return (int)((pow(_prefs.rx_delay_base, 0.85f - score) - 1.0) * air_time);
+}
+
+uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
+  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.5f);
+  return getRNG()->nextInt(0, 5*t + 1);
+}
+uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
+  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.2f);
+  return getRNG()->nextInt(0, 5*t + 1);
 }
 
 uint8_t MyMesh::getExtraAckTransmitCount() const {
@@ -308,6 +323,10 @@ bool MyMesh::shouldOverwriteWhenFull() const {
   return (_prefs.autoadd_config & AUTO_ADD_OVERWRITE_OLDEST) != 0;
 }
 
+uint8_t MyMesh::getAutoAddMaxHops() const {
+  return _prefs.autoadd_max_hops;
+}
+
 void MyMesh::onContactOverwrite(const uint8_t* pub_key) {
     _store->deleteBlobByKey(pub_key, PUB_KEY_SIZE); // delete from storage
   if (_serial->isConnected()) {
@@ -340,7 +359,7 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
   }
 
   // add inbound-path to mem cache
-  if (path && path_len <= sizeof(AdvertPath::path)) {  // check path is valid
+  if (path && mesh::Packet::isValidPathLen(path_len)) {  // check path is valid
     AdvertPath* p = advert_paths;
     uint32_t oldest = 0xFFFFFFFF;
     for (int i = 0; i < ADVERT_PATH_TABLE_SIZE; i++) {   // check if already in table, otherwise evict oldest
@@ -357,8 +376,7 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
     memcpy(p->pubkey_prefix, contact.id.pub_key, sizeof(p->pubkey_prefix));
     strcpy(p->name, contact.name);
     p->recv_timestamp = getRTCClock()->getCurrentTime();
-    p->path_len = path_len;
-    memcpy(p->path, path, p->path_len);
+    p->path_len = mesh::Packet::copyPath(p->path, path, path_len);
   }
 
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]
@@ -464,23 +482,23 @@ bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
 void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
   // TODO: dynamic send_scope, depending on recipient and current 'home' Region
   if (send_scope.isNull()) {
-    sendFlood(pkt, delay_millis);
+    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
   } else {
     uint16_t codes[2];
     codes[0] = send_scope.calcTransportCode(pkt);
     codes[1] = 0;  // REVISIT: set to 'home' Region, for sender/return region?
-    sendFlood(pkt, codes, delay_millis);
+    sendFlood(pkt, codes, delay_millis, _prefs.path_hash_mode + 1);
   }
 }
 void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
   // TODO: have per-channel send_scope
   if (send_scope.isNull()) {
-    sendFlood(pkt, delay_millis);
+    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
   } else {
     uint16_t codes[2];
     codes[0] = send_scope.calcTransportCode(pkt);
     codes[1] = 0;  // REVISIT: set to 'home' Region, for sender/return region?
-    sendFlood(pkt, codes, delay_millis);
+    sendFlood(pkt, codes, delay_millis, _prefs.path_hash_mode + 1);
   }
 }
 
@@ -677,7 +695,7 @@ bool MyMesh::onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t i
     if (tag == pending_discovery) {  // check for matching response tag)
       pending_discovery = 0;
 
-      if (in_path_len > MAX_PATH_SIZE || out_path_len > MAX_PATH_SIZE) {
+      if (!mesh::Packet::isValidPathLen(in_path_len) || !mesh::Packet::isValidPathLen(out_path_len)) {
         MESH_DEBUG_PRINTLN("onContactPathRecv, invalid path sizes: %d, %d", in_path_len, out_path_len);
       } else {
         int i = 0;
@@ -686,11 +704,9 @@ bool MyMesh::onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t i
         memcpy(&out_frame[i], contact.id.pub_key, 6);
         i += 6; // pub_key_prefix
         out_frame[i++] = out_path_len;
-        memcpy(&out_frame[i], out_path, out_path_len);
-        i += out_path_len;
+        i += mesh::Packet::writePath(&out_frame[i], out_path, out_path_len);
         out_frame[i++] = in_path_len;
-        memcpy(&out_frame[i], in_path, in_path_len);
-        i += in_path_len;
+        i += mesh::Packet::writePath(&out_frame[i], in_path, in_path_len);
         // NOTE: telemetry data in 'extra' is discarded at present
 
         _serial->writeFrame(out_frame, i);
@@ -776,9 +792,10 @@ uint32_t MyMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const {
   return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * pkt_airtime_millis);
 }
 uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const {
+  uint8_t path_hash_count = path_len & 63;
   return SEND_TIMEOUT_BASE_MILLIS +
          ((pkt_airtime_millis * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) *
-          (path_len + 1));
+          (path_hash_count + 1));
 }
 
 void MyMesh::onSendTimeout() {}
@@ -799,7 +816,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 
   // defaults
   memset(&_prefs, 0, sizeof(_prefs));
-  _prefs.airtime_factor = 1.0; // one half
+  _prefs.airtime_factor = 1.0;
   strcpy(_prefs.node_name, "NONAME");
   _prefs.freq = LORA_FREQ;
   _prefs.sf = LORA_SF;
@@ -898,12 +915,10 @@ static FreqRange repeat_freq_ranges[] = {
 };
 
 bool MyMesh::isValidClientRepeatFreq(uint32_t f) const {
-  for (int i = 0; i < sizeof(repeat_freq_ranges)/sizeof(repeat_freq_ranges[0]); i++) {
-    auto r = &repeat_freq_ranges[i];
-    if (f >= r->lower_freq && f <= r->upper_freq) return true;
-  }
-  return false;
+  (void)f;      // avoid unused warning
+  return true;  // allow repeat on all frequencies
 }
+
 
 void MyMesh::startInterface(BaseSerialInterface &serial) {
   _serial = &serial;
@@ -929,6 +944,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     StrHelper::strzcpy((char *)&out_frame[i], FIRMWARE_VERSION, 20);
     i += 20;
     out_frame[i++] = _prefs.client_repeat;   // v9+
+    out_frame[i++] = _prefs.path_hash_mode;  // v10+
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_APP_START &&
              len >= 8) { // sent when app establishes connection, respond with node ID
@@ -1106,7 +1122,8 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     if (pkt) {
       if (len >= 2 && cmd_frame[1] == 1) { // optional param (1 = flood, 0 = zero hop)
-        sendFlood(pkt);
+        unsigned long delay_millis = 0;
+        sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
       } else {
         sendZeroHop(pkt);
       }
@@ -1118,7 +1135,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint8_t *pub_key = &cmd_frame[1];
     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (recipient) {
-      recipient->out_path_len = -1;
+      recipient->out_path_len = OUT_PATH_UNKNOWN;
       // recipient->lastmod = ??   shouldn't be needed, app already has this version of contact
       dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
       writeOKFrame();
@@ -1303,6 +1320,14 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     savePrefs();
     writeOKFrame();
+  } else if (cmd_frame[0] == CMD_SET_PATH_HASH_MODE && cmd_frame[1] == 0 && len >= 3) {
+    if (cmd_frame[2] >= 3) {
+      writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    } else {
+      _prefs.path_hash_mode = cmd_frame[2];
+      savePrefs();
+      writeOKFrame();
+    }
   } else if (cmd_frame[0] == CMD_REBOOT && memcmp(&cmd_frame[1], "reboot", 6) == 0) {
     if (dirty_contacts_expiry) { // is there are pending dirty contacts write needed?
       saveContacts();
@@ -1440,7 +1465,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       memset(&req_data[2], 0, 3);  // reserved
       getRNG()->random(&req_data[5], 4);   // random blob to help make packet-hash unique
       auto save = recipient->out_path_len;    // temporarily force sendRequest() to flood
-      recipient->out_path_len = -1;
+      recipient->out_path_len = OUT_PATH_UNKNOWN;
       int result = sendRequest(*recipient, req_data, sizeof(req_data), tag, est_timeout);
       recipient->out_path_len = save;
       if (result == MSG_SEND_FAILED) {
@@ -1677,11 +1702,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       }
     }
     if (found) {
-      out_frame[0] = RESP_CODE_ADVERT_PATH;
-      memcpy(&out_frame[1], &found->recv_timestamp, 4);
-      out_frame[5] = found->path_len;
-      memcpy(&out_frame[6], found->path, found->path_len);
-      _serial->writeFrame(out_frame, 6 + found->path_len);
+      int i = 0;
+      out_frame[i++] = RESP_CODE_ADVERT_PATH;
+      memcpy(&out_frame[i], &found->recv_timestamp, 4); i += 4;
+      out_frame[i++] = found->path_len;
+      i += mesh::Packet::writePath(&out_frame[i], found->path, found->path_len);
+      _serial->writeFrame(out_frame, i);
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
     }
@@ -1693,7 +1719,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       out_frame[i++] = STATS_TYPE_CORE;
       uint16_t battery_mv = board.getBattMilliVolts();
       uint32_t uptime_secs = _ms->getMillis() / 1000;
-      uint8_t queue_len = (uint8_t)_mgr->getOutboundCount(0xFFFFFFFF);
+      uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
       memcpy(&out_frame[i], &battery_mv, 2); i += 2;
       memcpy(&out_frame[i], &uptime_secs, 4); i += 4;
       memcpy(&out_frame[i], &_err_flags, 2); i += 2;
@@ -1766,12 +1792,16 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
   } else if (cmd_frame[0] == CMD_SET_AUTOADD_CONFIG) {
     _prefs.autoadd_config = cmd_frame[1];
+    if (len >= 3) {
+      _prefs.autoadd_max_hops = min(cmd_frame[2], (uint8_t)64);
+    }
     savePrefs();
-    writeOKFrame();  
+    writeOKFrame();
   } else if (cmd_frame[0] == CMD_GET_AUTOADD_CONFIG) {
     int i = 0;
     out_frame[i++] = RESP_CODE_AUTOADD_CONFIG;
     out_frame[i++] = _prefs.autoadd_config;
+    out_frame[i++] = _prefs.autoadd_max_hops;
     _serial->writeFrame(out_frame, i);
   } else if (cmd_frame[0] == CMD_GET_ALLOWED_REPEAT_FREQ) {
     int i = 0;
@@ -1796,7 +1826,7 @@ void MyMesh::enterCLIRescue() {
 
 void MyMesh::checkCLIRescueCmd() {
   int len = strlen(cli_command);
-  while (Serial.available() && len < sizeof(cli_command)-1) {
+  while (Serial.available() && len < (int)sizeof(cli_command) - 1) {
     char c = Serial.read();
     if (c != '\n') {
       cli_command[len++] = c;
@@ -1804,22 +1834,100 @@ void MyMesh::checkCLIRescueCmd() {
     }
     Serial.print(c);  // echo
   }
-  if (len == sizeof(cli_command)-1) {  // command buffer full
-    cli_command[sizeof(cli_command)-1] = '\r';
+
+  if (len == (int)sizeof(cli_command) - 1) {  // command buffer full
+    cli_command[sizeof(cli_command) - 1] = '\r';
   }
 
   if (len > 0 && cli_command[len - 1] == '\r') {  // received complete line
     cli_command[len - 1] = 0;  // replace newline with C string null terminator
 
+    // ---- helpers (local lambdas, no header changes needed) ----
+    auto isspace_c = [](char ch) -> bool { return ch == ' ' || ch == '\t'; };
+
+    auto skip_ws = [&](const char* s) -> const char* {
+      while (*s && isspace_c(*s)) s++;
+      return s;
+    };
+
+    auto parse_float = [&](const char* s, float& out) -> bool {
+      s = skip_ws(s);
+      if (!*s) return false;
+      char* endp = nullptr;
+      out = strtof(s, &endp);
+      if (endp == s) return false; // no parse
+      endp = (char*)skip_ws(endp);
+      // allow trailing junk? we reject if non-empty
+      if (*endp != 0) return false;
+      return true;
+    };
+
+    auto cmd_is = [&](const char* a, const char* b) -> bool {
+      return strcmp(a, b) == 0;
+    };
+
+    // ---- new: quick "help" ----
+    if (cmd_is(cli_command, "help")) {
+      Serial.println("CLI Rescue commands:");
+      Serial.println("  set pin <6digit|0>");
+      Serial.println("  set af <0..9>        (airtime_factor; use 0 to disable limiting for lab)");
+      Serial.println("  set rx <0..20>       (rx_delay_base)");
+      Serial.println("  get tuning           (print rx_delay_base and airtime_factor)");
+      Serial.println("  rebuild | erase | ls <path> | cat <path> | rm <path> | reboot");
+      cli_command[0] = 0;
+      return;
+    }
+
+    // ---- new: get tuning ----
+    if (cmd_is(cli_command, "get tuning")) {
+      Serial.printf("  > rx_delay_base: %.3f\n", _prefs.rx_delay_base);
+      Serial.printf("  > airtime_factor: %.3f\n", _prefs.airtime_factor);
+      cli_command[0] = 0;
+      return;
+    }
+
+    // ---- existing: set ... (extended) ----
     if (memcmp(cli_command, "set ", 4) == 0) {
       const char* config = &cli_command[4];
+
+      // set pin
       if (memcmp(config, "pin ", 4) == 0) {
         _prefs.ble_pin = atoi(&config[4]);
         savePrefs();
         Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
+
+      // NEW: set af <float>
+      } else if (memcmp(config, "af ", 3) == 0) {
+        float v = 0.0f;
+        if (!parse_float(&config[3], v)) {
+          Serial.println("  Error: usage: set af <0..9>");
+        } else {
+          v = constrain(v, 0.0f, 9.0f);
+          _prefs.airtime_factor = v;
+          savePrefs();
+          Serial.printf("  > airtime_factor is now %.3f\n", _prefs.airtime_factor);
+          if (_prefs.airtime_factor <= 0.0f) {
+            Serial.println("  > NOTE: airtime limiting disabled (lab mode)");
+          }
+        }
+
+      // NEW: set rx <float>
+      } else if (memcmp(config, "rx ", 3) == 0) {
+        float v = 0.0f;
+        if (!parse_float(&config[3], v)) {
+          Serial.println("  Error: usage: set rx <0..20>");
+        } else {
+          v = constrain(v, 0.0f, 20.0f);
+          _prefs.rx_delay_base = v;
+          savePrefs();
+          Serial.printf("  > rx_delay_base is now %.3f\n", _prefs.rx_delay_base);
+        }
+
       } else {
         Serial.printf("  Error: unknown config: %s\n", config);
       }
+
+    // ---- existing commands unchanged below ----
     } else if (strcmp(cli_command, "rebuild") == 0) {
       bool success = _store->formatFileSystem();
       if (success) {
@@ -1831,6 +1939,7 @@ void MyMesh::checkCLIRescueCmd() {
       } else {
         Serial.println("  Error: erase failed");
       }
+
     } else if (strcmp(cli_command, "erase") == 0) {
       bool success = _store->formatFileSystem();
       if (success) {
@@ -1838,21 +1947,19 @@ void MyMesh::checkCLIRescueCmd() {
       } else {
         Serial.println("  Error: erase failed");
       }
-    } else if (memcmp(cli_command, "ls", 2) == 0) {
 
-      // get path from command e.g: "ls /adafruit"
+    } else if (memcmp(cli_command, "ls", 2) == 0) {
       const char *path = &cli_command[3];
 
       bool is_fs2 = false;
       if (memcmp(path, "UserData/", 9) == 0) {
-        path += 8; // skip "UserData"
+        path += 8;
       } else if (memcmp(path, "ExtraFS/", 8) == 0) {
-        path += 7; // skip "ExtraFS"
+        path += 7;
         is_fs2 = true;
       }
       Serial.printf("Listing files in %s\n", path);
 
-      // log each file and directory
       File root = _store->openRead(path);
       if (is_fs2 == false) {
         if (root) {
@@ -1861,9 +1968,8 @@ void MyMesh::checkCLIRescueCmd() {
             if (file.isDirectory()) {
               Serial.printf("[dir]  UserData%s/%s\n", path, file.name());
             } else {
-              Serial.printf("[file] UserData%s/%s (%d bytes)\n", path, file.name(), file.size());
+              Serial.printf("[file] UserData%s/%s (%d bytes)\n", path, file.name(), (int)file.size());
             }
-            // move to next file
             file = root.openNextFile();
           }
           root.close();
@@ -1878,24 +1984,22 @@ void MyMesh::checkCLIRescueCmd() {
             if (file.isDirectory()) {
               Serial.printf("[dir]  ExtraFS%s/%s\n", path, file.name());
             } else {
-              Serial.printf("[file] ExtraFS%s/%s (%d bytes)\n", path, file.name(), file.size());
+              Serial.printf("[file] ExtraFS%s/%s (%d bytes)\n", path, file.name(), (int)file.size());
             }
-            // move to next file
             file = root2.openNextFile();
           }
           root2.close();
         }
       }
-    } else if (memcmp(cli_command, "cat", 3) == 0) {
 
-      // get path from command e.g: "cat /contacts3"
+    } else if (memcmp(cli_command, "cat", 3) == 0) {
       const char *path = &cli_command[4];
-      
+
       bool is_fs2 = false;
       if (memcmp(path, "UserData/", 9) == 0) {
-        path += 8; // skip "UserData"
+        path += 8;
       } else if (memcmp(path, "ExtraFS/", 8) == 0) {
-        path += 7; // skip "ExtraFS"
+        path += 7;
         is_fs2 = true;
       } else {
         Serial.println("Invalid path provided, must start with UserData/ or ExtraFS/");
@@ -1903,43 +2007,34 @@ void MyMesh::checkCLIRescueCmd() {
         return;
       }
 
-      // log file content as hex
       File file = _store->openRead(path);
       if (is_fs2 == true) {
         file = _store->openRead(_store->getSecondaryFS(), path);
       }
-      if(file){
-
-        // get file content
+      if (file) {
         int file_size = file.available();
         uint8_t buffer[file_size];
         file.read(buffer, file_size);
-
-        // print hex
         mesh::Utils::printHex(Serial, buffer, file_size);
         Serial.print("\n");
-
         file.close();
-
       }
 
     } else if (memcmp(cli_command, "rm ", 3) == 0) {
-      // get path from command e.g: "rm /adv_blobs"
       const char *path = &cli_command[3];
       MESH_DEBUG_PRINTLN("Removing file: %s", path);
-      // ensure path is not empty, or root dir
-      if(!path || strlen(path) == 0 || strcmp(path, "/") == 0){
+
+      if (!path || strlen(path) == 0 || strcmp(path, "/") == 0) {
         Serial.println("Invalid path provided");
       } else {
-      bool is_fs2 = false;
-      if (memcmp(path, "UserData/", 9) == 0) {
-        path += 8; // skip "UserData"
-      } else if (memcmp(path, "ExtraFS/", 8) == 0) {
-        path += 7; // skip "ExtraFS"
-        is_fs2 = true;
-      }
+        bool is_fs2 = false;
+        if (memcmp(path, "UserData/", 9) == 0) {
+          path += 8;
+        } else if (memcmp(path, "ExtraFS/", 8) == 0) {
+          path += 7;
+          is_fs2 = true;
+        }
 
-        // remove file
         bool removed;
         if (is_fs2) {
           MESH_DEBUG_PRINTLN("Removing file from ExtraFS: %s", path);
@@ -1948,16 +2043,13 @@ void MyMesh::checkCLIRescueCmd() {
           MESH_DEBUG_PRINTLN("Removing file from UserData: %s", path);
           removed = _store->removeFile(path);
         }
-        if(removed){
-          Serial.println("File removed");
-        } else {
-          Serial.println("Failed to remove file");
-        }
 
+        Serial.println(removed ? "File removed" : "Failed to remove file");
       }
 
     } else if (strcmp(cli_command, "reboot") == 0) {
       board.reboot();  // doesn't return
+
     } else {
       Serial.println("  Error: unknown command");
     }

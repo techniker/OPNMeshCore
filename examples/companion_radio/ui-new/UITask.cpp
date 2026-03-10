@@ -65,6 +65,9 @@ public:
     display.setTextSize(1);
     display.drawTextCentered(display.width()/2, 42, FIRMWARE_BUILD_DATE);
 
+    display.setTextSize(4);
+    display.drawTextCentered(display.width()/2, 52, "MeshCore.Sixtopia.net");
+
     return 1000;
   }
 
@@ -101,45 +104,53 @@ class HomeScreen : public UIScreen {
   AdvertPath recent[UI_RECENT_LIST_SIZE];
 
 
-  void renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts) {
-    // Convert millivolts to percentage
+void renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts) {
 #ifndef BATT_MIN_MILLIVOLTS
   #define BATT_MIN_MILLIVOLTS 3000
 #endif
 #ifndef BATT_MAX_MILLIVOLTS
   #define BATT_MAX_MILLIVOLTS 4200
 #endif
-    const int minMilliVolts = BATT_MIN_MILLIVOLTS;
-    const int maxMilliVolts = BATT_MAX_MILLIVOLTS;
-    int batteryPercentage = ((batteryMilliVolts - minMilliVolts) * 100) / (maxMilliVolts - minMilliVolts);
-    if (batteryPercentage < 0) batteryPercentage = 0; // Clamp to 0%
-    if (batteryPercentage > 100) batteryPercentage = 100; // Clamp to 100%
 
-    // battery icon
-    int iconWidth = 24;
-    int iconHeight = 10;
-    int iconX = display.width() - iconWidth - 5; // Position the icon near the top-right corner
-    int iconY = 0;
-    display.setColor(DisplayDriver::GREEN);
+  const int minMilliVolts = BATT_MIN_MILLIVOLTS;
+  const int maxMilliVolts = BATT_MAX_MILLIVOLTS;
 
-    // battery outline
-    display.drawRect(iconX, iconY, iconWidth, iconHeight);
+  int batteryPercentage =
+      ((batteryMilliVolts - minMilliVolts) * 100) /
+      (maxMilliVolts - minMilliVolts);
 
-    // battery "cap"
-    display.fillRect(iconX + iconWidth, iconY + (iconHeight / 4), 3, iconHeight / 2);
+  if (batteryPercentage < 0) batteryPercentage = 0;
+  if (batteryPercentage > 100) batteryPercentage = 100;
 
-    // fill the battery based on the percentage
-    int fillWidth = (batteryPercentage * (iconWidth - 4)) / 100;
-    display.fillRect(iconX + 2, iconY + 2, fillWidth, iconHeight - 4);
+  // Convert to float voltage
+  float voltage = batteryMilliVolts / 1000.0f;
 
-    // show muted icon if buzzer is muted
-#ifdef PIN_BUZZER
-    if (_task->isBuzzerQuiet()) {
-      display.setColor(DisplayDriver::RED);
-      display.drawXbm(iconX - 9, iconY + 1, muted_icon, 8, 8);
-    }
-#endif
-  }
+  int iconWidth = 24;
+  int iconHeight = 10;
+  int iconX = display.width() - iconWidth - 5;
+  int iconY = 0;
+
+  display.setColor(DisplayDriver::GREEN);
+
+  // Draw battery outline
+  display.drawRect(iconX, iconY, iconWidth, iconHeight);
+  display.fillRect(iconX + iconWidth,
+                   iconY + (iconHeight / 4),
+                   3,
+                   iconHeight / 2);
+
+  int fillWidth = (batteryPercentage * (iconWidth - 4)) / 100;
+  display.fillRect(iconX + 2, iconY + 2, fillWidth, iconHeight - 4);
+
+  // --- ADD VOLTAGE TEXT ---
+  char vbuf[10];
+  sprintf(vbuf, "%.2fV", voltage);
+
+  display.setTextSize(1);
+  display.setCursor(iconX - display.getTextWidth(vbuf) - 3, iconY);
+  display.print(vbuf);
+}
+
 
   CayenneLPP sensors_lpp;
   int sensors_nb = 0;
@@ -209,6 +220,13 @@ public:
       sprintf(tmp, "MSG: %d", _task->getMsgCount());
       display.drawTextCentered(display.width() / 2, 20, tmp);
 
+      // ---- Airtime factor (uses your new wrapper) ----
+      display.setTextSize(1);
+      display.setColor(DisplayDriver::LIGHT);
+      float af = _task->getAirtimeFactor();   // 0.0f if LAB_DISABLE_AIRTIME
+      snprintf(tmp, sizeof(tmp), "AF: %.2f", af);
+      display.drawTextCentered(display.width() / 2, 34, tmp);
+
       #ifdef WIFI_SSID
         IPAddress ip = WiFi.localIP();
         snprintf(tmp, sizeof(tmp), "IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
@@ -219,6 +237,15 @@ public:
         display.setColor(DisplayDriver::GREEN);
         display.setTextSize(1);
         display.drawTextCentered(display.width() / 2, 43, "< Connected >");
+
+      // ---- Footer (always at bottom) ----
+        display.setColor(DisplayDriver::GREEN);
+        display.setTextSize(1);
+        display.drawTextCentered(display.width() / 2, 53, "ClientRepeat: ON");
+
+        display.setColor(DisplayDriver::GREEN);
+        display.setTextSize(1);
+        display.drawTextCentered(display.width() / 2, 80, "MeshCore.Sixtopia.net");
 
       } else if (the_mesh.getBLEPin() != 0) { // BT pin
         display.setColor(DisplayDriver::RED);
@@ -933,3 +960,8 @@ void UITask::toggleBuzzer() {
     _next_refresh = 0;  // trigger refresh
   #endif
 }
+
+float UITask::getAirtimeFactor() const {
+  return the_mesh.getAirtimeBudgetFactorPublic();  // 0.0f if LAB_DISABLE_AIRTIME
+}
+
