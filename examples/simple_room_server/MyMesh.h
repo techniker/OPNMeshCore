@@ -30,7 +30,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.14.1"
+  #define FIRMWARE_VERSION   "v1.14.1-opn"
 #endif
 
 #ifndef LORA_FREQ
